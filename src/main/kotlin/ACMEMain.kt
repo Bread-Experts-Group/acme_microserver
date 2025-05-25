@@ -4,38 +4,30 @@ import org.bread_experts_group.Flag
 import org.bread_experts_group.acme_microserver.crypto.KeyPairFile
 import org.bread_experts_group.acme_microserver.crypto.read
 import org.bread_experts_group.acme_microserver.crypto.restrictToLocal
+import org.bread_experts_group.acme_microserver.handler.ACMEChallengeHandler
 import org.bread_experts_group.acme_microserver.jws.JSONWebKey
 import org.bread_experts_group.acme_microserver.jws.JSONWebKeyProtectedHeader
 import org.bread_experts_group.acme_microserver.jws.JSONWebSignatureSignedData
-import org.bread_experts_group.acme_microserver.x509.X509ASN1Certificate
 import org.bread_experts_group.acme_microserver.x509.X509ASN1CertificateSigningRequest
 import org.bread_experts_group.coder.fixed.json.JSONConvertible
 import org.bread_experts_group.logging.ColoredLogger
 import org.bread_experts_group.readArgs
-import org.bread_experts_group.stream.writeString
 import org.bread_experts_group.stringToBoolean
 import org.bread_experts_group.stringToInt
 import org.bread_experts_group.stringToURI
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.net.InetSocketAddress
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.file.Files
 import java.security.KeyStore
-import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.util.Base64
-import java.util.concurrent.CountDownLatch
-import javax.net.ssl.KeyManagerFactory
-import javax.net.ssl.SSLContext
-import javax.net.ssl.SSLServerSocket
-import javax.net.ssl.SSLSocket
+import java.util.ServiceLoader
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.readText
 
@@ -63,6 +55,15 @@ fun createP12Keystore(
 
 fun main(args: Array<String>) {
 	val logger = ColoredLogger.newLogger("ACME Microserver Main")
+	logger.info("Loading ACME challenge handlers ...")
+	val handlers = ServiceLoader.load(ACMEChallengeHandler::class.java)
+		.associateBy { it.identifier() }
+		.toMutableMap()
+	val handlersPreferenceOrder = handlers
+		.map { it.value }
+		.toMutableList()
+	handlersPreferenceOrder.sortByDescending { it.defaultPreference() }
+	logger.info("Loaded ACME challenge handlers: [${handlersPreferenceOrder.joinToString(",") { it.identifier() }}]")
 	val (singleArgs, multipleArgs) = readArgs(
 		args,
 		"acme_microserver",
@@ -139,8 +140,30 @@ fun main(args: Array<String>) {
 		),
 		Flag(
 			"tls_alpn_01_port",
-			"The port used for the verification server for TLS-ALPN-01.",
+			"The TCP port used for the verification server for TLS-ALPN-01.",
 			default = 443,
+			conv = ::stringToInt
+		),
+		Flag(
+			"http_01_ip",
+			"The IP used for the verification server for HTTP-01.",
+			default = "0.0.0.0"
+		),
+		Flag(
+			"http_01_port",
+			"The TCP port used for the verification server for HTTP-01.",
+			default = 80,
+			conv = ::stringToInt
+		),
+		Flag(
+			"dns_01_ip",
+			"The IP used for the verification server for HTTP-01.",
+			default = "0.0.0.0"
+		),
+		Flag(
+			"dns_01_port",
+			"The TCP / UDP port used for the verification server for DNS-01.",
+			default = 53,
 			conv = ::stringToInt
 		),
 		Flag(
@@ -161,6 +184,40 @@ fun main(args: Array<String>) {
 			default = P12FileLinkOption.FS_HARD_LINK,
 			conv = { P12FileLinkOption.valueOf(it) }
 		),
+		Flag(
+			"challenge_preference",
+			"Specifies the order of preference challenges will be done in. All challenges must be specified.",
+			default = handlersPreferenceOrder.joinToString(",") { it.identifier() },
+			conv = {
+				val setHandlers = it.split(',')
+				setHandlers.forEach { set ->
+					if (!handlers.containsKey(set)) throw IllegalArgumentException("Challenge [$set] is not loaded.")
+				}
+				if (setHandlers.size != handlers.size)
+					throw IllegalArgumentException("You must specify all challenges for preference order.")
+				var i = 0
+				val redefined = setHandlers.associateWith { i++ }
+				handlersPreferenceOrder.sortBy { h -> redefined[h.identifier()] }
+				logger.info {
+					"Sorted ACME challenge handlers: [${
+						handlersPreferenceOrder.joinToString(",") { h -> h.identifier() }
+					}]"
+				}
+			}
+		),
+		Flag(
+			"disable_challenges",
+			"Disables the specified challenges.",
+			default = "",
+			conv = {
+				val setHandlers = it.split(',')
+				setHandlers.forEach { set ->
+					if (!handlers.containsKey(set)) throw IllegalArgumentException("Challenge [$set] is not loaded.")
+					handlers.remove(set)
+					handlersPreferenceOrder.removeIf { h -> h.identifier() == set }
+				}
+			}
+		)
 	)
 	logger.info("Creating JSON web key (JWK) along w/ keypair")
 	val directorySource = singleArgs.getValue("acme_directory") as URI
@@ -236,16 +293,21 @@ fun main(args: Array<String>) {
 		logger.info("Account $status: ${userReturned.statusCode()} [$location]")
 		location
 	}
-	logger.info("Placing ACME order [${directory.newOrder}]")
 	var lastOrder: URI? = null
 	fun sendOrder(): ACMEOrderResponse {
-		val payload = if (lastOrder == null) ACMEOrderPlacement(buildList {
-			multipleArgs.getValue("domain").forEach {
-				it as String
-				add(ACMEOrder("dns", it))
+		val payload = if (lastOrder == null) {
+			logger.info("Placing ACME order [${directory.newOrder}]")
+			ACMEOrderPlacement(buildList {
+				multipleArgs.getValue("domain").forEach {
+					it as String
+					add(ACMEOrder("dns", it))
+				}
+			}, singleArgs["acme_profile"] as? String)
+		} else {
+			logger.info("Checking ACME order [$lastOrder]")
+			object : JSONConvertible {
+				override fun toJSON(): String = ""
 			}
-		}, singleArgs["acme_profile"] as? String) else object : JSONConvertible {
-			override fun toJSON(): String = ""
 		}
 		val protected = JSONWebKeyProtectedHeader(
 			"ES256", getNonce(),
@@ -290,104 +352,59 @@ fun main(args: Array<String>) {
 		}
 		val authorization = ACMEAuthorization.read(authorizationResponse.body())
 		val localFileBase = thisRunBase.resolve(authorization.identifier.value + '/')
-		authorization.challenges.firstOrNull { it.type.lowercase() == "tls-alpn-01" }?.let {
-			val serverSocket = X509ASN1Certificate(
-				jwsKeyPair,
-				authorization.identifier.value,
-				MessageDigest
-					.getInstance("SHA-256")
-					.digest("${it.token}.${jsonWebKey.thumbprint()}".toByteArray())
-			).x509.asBytes().let { x509Bytes ->
-				if (singleArgs.getValue("tls_alpn_01_save_temporary_certificate") as Boolean) {
-					localFileBase.mkdirs()
-					localFileBase
-						.resolve("alpn-01.crt")
-						.writeBytes(x509Bytes)
-				}
-				val certFactory = CertificateFactory.getInstance("X.509")
-				val cert = certFactory.generateCertificate(ByteArrayInputStream(x509Bytes)) as X509Certificate
-				val keyStore = KeyStore.getInstance("JKS")
-				keyStore.load(null, null)
-				keyStore.setKeyEntry("alias", jwsKeyPair.private, charArrayOf('!'), arrayOf(cert))
-				val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-				kmf.init(keyStore, charArrayOf('!'))
-
-				val sslContext = SSLContext.getInstance("TLS")
-				sslContext.init(kmf.keyManagers, null, null)
-				sslContext.serverSocketFactory
-			}
-
-			authLogger.info("Binding on port 443 for TLS-ALPN-01 challenge")
-			val localServer443 = serverSocket.createServerSocket() as SSLServerSocket
-			localServer443.bind(
-				InetSocketAddress(
-					singleArgs.getValue("tls_alpn_01_ip") as String,
-					singleArgs.getValue("tls_alpn_01_port") as Int
-				)
-			)
-			val parameters = localServer443.sslParameters
-			parameters.applicationProtocols = arrayOf("acme-tls/1")
-			localServer443.sslParameters = parameters
-			val rendezvous = CountDownLatch(1)
-			val block = CountDownLatch(1)
-			val serverThread = Thread.ofVirtual().start {
-				while (!Thread.interrupted()) {
-					try {
-						rendezvous.countDown()
-						val sock = localServer443.accept() as SSLSocket
-						sock.startHandshake()
-						authLogger.info {
-							"Got connection [${sock.remoteSocketAddress}] for [${sock.applicationProtocol}]"
-						}
-						if (sock.applicationProtocol != "acme-tls/1") {
-							sock.close()
-							continue
-						}
-						sock.outputStream.writeString("HTTP/1.1 200\r\nContent-Length:9\r\n\r\nHello SSL")
-						block.countDown()
-					} catch (_: Exception) {
-					}
-				}
-				authLogger.info("Going offline.")
-				localServer443.close()
-			}
-
-			fun sendCheck(status: Boolean): ACMEChallenge {
-				authLogger.info {
-					val first = if (status) "Checking challenge status ..."
-					else "Initiating challenge ..."
-					first + " [${it.url} / ${it.token}]"
-				}
-				val payload = object : JSONConvertible {
-					override fun toJSON(): String = if (status) "" else "{}"
-				}
-				val protected = JSONWebKeyProtectedHeader("ES256", getNonce(), it.url, userAccount.toString())
-				val signedData = JSONWebSignatureSignedData.createSignedData(protected, payload, jwsKeyPair)
-				return ACMEChallenge.read(
-					httpClient.send(
-						HttpRequest
-							.newBuilder(it.url)
-							.header("Content-Type", "application/jose+json")
-							.method("POST", HttpRequest.BodyPublishers.ofString(signedData.toJSON()))
-							.build(),
-						HttpResponse.BodyHandlers.ofInputStream()
-					).body()
-				)
-			}
-
-			rendezvous.await()
-			authLogger.info("Server active; ${localServer443.localSocketAddress}")
-
-			var challenge = sendCheck(false)
-			while (true) {
-				authLogger.info("Challenge status: ${challenge.status}")
-				if (challenge.status != "pending") break
-				block.await()
-				Thread.sleep(5000)
-				challenge = sendCheck(true)
-			}
-			serverThread.interrupt()
+		val typedChallenges = authorization.challenges.associateBy { it.type }
+		val challengeParameters = handlersPreferenceOrder.firstNotNullOfOrNull {
+			val challenge = typedChallenges[it.identifier()]
+			if (challenge != null) challenge to it
+			else null
 		}
+		if (challengeParameters == null) throw IllegalStateException(
+			"No challenge was supported for ${authorization.identifier.value}\nChallenges: ${authorization.challenges}"
+		)
+		val (challenge, handler) = challengeParameters
+		val (thread, rendezvous, block) = handler.handle(
+			singleArgs, multipleArgs,
+			jwsKeyPair, jsonWebKey,
+			authorization, challenge,
+			localFileBase, authLogger
+		)
+
+		fun sendCheck(status: Boolean): ACMEChallenge {
+			authLogger.info {
+				val first = if (status) "Checking challenge status ..."
+				else "Initiating challenge ..."
+				first + " [${challenge.url} / ${challenge.token}]"
+			}
+			val payload = object : JSONConvertible {
+				override fun toJSON(): String = if (status) "" else "{}"
+			}
+			val protected = JSONWebKeyProtectedHeader(
+				"ES256", getNonce(),
+				challenge.url, userAccount.toString()
+			)
+			val signedData = JSONWebSignatureSignedData.createSignedData(protected, payload, jwsKeyPair)
+			return ACMEChallenge.read(
+				httpClient.send(
+					HttpRequest
+						.newBuilder(challenge.url)
+						.header("Content-Type", "application/jose+json")
+						.method("POST", HttpRequest.BodyPublishers.ofString(signedData.toJSON()))
+						.build(),
+					HttpResponse.BodyHandlers.ofInputStream()
+				).body()
+			)
+		}
+
+		rendezvous.await()
+		var challengeStatus = sendCheck(false)
+		while (true) {
+			authLogger.info("Challenge status: ${challengeStatus.status}")
+			if (challengeStatus.status != "pending") break
+			block.await()
+			Thread.sleep(5000)
+			challengeStatus = sendCheck(true)
+		}
+		thread.interrupt()
 	}
 	val crtKeyPair = KeyPairFile(
 		thisRunBase.resolve(singleArgs.getValue("crt_public_key") as String),
@@ -423,8 +440,8 @@ fun main(args: Array<String>) {
 						HttpRequest.BodyPublishers.ofString(signedData.toJSON())
 					)
 					.build(),
-				HttpResponse.BodyHandlers.ofString()
-			).body().also { println(it) }.byteInputStream()
+				HttpResponse.BodyHandlers.ofInputStream()
+			).body()
 		)
 		logger.info { "Requested finalization $names [${finalizeResponse.status}]" }
 	}
