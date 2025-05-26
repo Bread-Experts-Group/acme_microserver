@@ -1,6 +1,5 @@
 import java.util.Properties
 import kotlin.apply
-import kotlin.text.get
 
 plugins {
 	kotlin("jvm") version "2.1.10"
@@ -12,7 +11,7 @@ plugins {
 }
 
 group = "org.bread_experts_group"
-version = "1.0.0"
+version = "1.2.0"
 
 repositories {
 	mavenCentral()
@@ -20,14 +19,14 @@ repositories {
 }
 
 dependencies {
-	implementation("org.bread_experts_group:bread_server_lib-code:2.8.0")
+	implementation("org.bread_experts_group:bread_server_lib-code:2.13.0")
 }
 
 tasks.test {
 	useJUnitPlatform()
 }
 application {
-	mainClass = "org.bread_experts_group.acme_microserver.ACMEMainKt"
+	mainClass = "org.bread_experts_group.ACMEMainKt"
 	applicationDefaultJvmArgs = listOf(
 		"-XX:+UseZGC", "-Xms256m", "-Xmx256m", "-XX:SoftMaxHeapSize=128m", "-server",
 		"-XX:MaxDirectMemorySize=128m", "-XX:+AlwaysPreTouch", "-XX:+UseLargePages",
